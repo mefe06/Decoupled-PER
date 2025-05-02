@@ -105,8 +105,8 @@ class DPERReplayBuffer(object):
         rewards = torch.FloatTensor(self.rewards[indices])
         next_states = torch.FloatTensor(self.next_states[indices])
         not_dones = torch.FloatTensor(self.not_dones[indices])
-
-        return states, actions, rewards, next_states, not_dones, indices
+        sampling_probs = probs[indices] 
+        return states, actions, rewards, next_states, not_dones, indices, sampling_probs
 
     def sample_for_actor_candidates(self, batch_size, K):
         all_batches = []
@@ -143,7 +143,10 @@ class DPER_TD3(object):
         policy_freq=2,
         sigma_exploration=0.2,
         lr=3e-4,
-        buffer_size=1_000_00
+        buffer_size=1_000_000,
+        IS=False,
+        beta_start=0.4,
+        beta_frames=1_000_000,
     ):
         self.actor = Actor(state_dim, action_dim, max_action)
         self.actor_target = Actor(state_dim, action_dim, max_action)
@@ -164,7 +167,9 @@ class DPER_TD3(object):
         self.sigma_exploration = sigma_exploration
 
         self.total_it = 0
-
+        self.IS=IS
+        self.beta_start  = beta_start
+        self.beta_frames = beta_frames    
         # Decoupled PER buffer
         self.replay_buffer = DPERReplayBuffer(state_dim, action_dim, max_size=buffer_size)
 
@@ -177,7 +182,7 @@ class DPER_TD3(object):
     def train(self, batch_size=256, K=4):
 
         self.total_it += 1
-        (states, actions, rewards, next_states, not_dones, indices
+        (states, actions, rewards, next_states, not_dones, indices, sampling_probs
         ) = self.replay_buffer.sample_for_critic(batch_size)
 
         with torch.no_grad():
@@ -188,9 +193,28 @@ class DPER_TD3(object):
             target_Q1, target_Q2 = self.critic_target(next_states, next_action)
             target_Q = torch.min(target_Q1, target_Q2)
             target_Q = rewards + not_dones * self.gamma * target_Q
+        
+        if self.IS:
+            fraction = min(float(self.total_it) / self.beta_frames, 1.0)
+            beta = self.beta_start + fraction * (1.0 - self.beta_start)
+            current_Q1, current_Q2 = self.critic(states, actions)
+            N    = float(self.replay_buffer.size)
+            # importance weights
+            w  = (1.0 / (N * sampling_probs)) ** beta            # shape: (batch,)
+            w  = w / w.max()                                     # normalize so max weight = 1
+            w  = torch.from_numpy(w).unsqueeze(1)    # shape: (batch,1)
 
-        current_Q1, current_Q2 = self.critic(states, actions)
-        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+            # now per‐sample TD errors
+            td1 = (current_Q1 - target_Q).pow(2)                  # (batch,1)
+            td2 = (current_Q2 - target_Q).pow(2)
+
+            # weighted MSE
+            loss1 = (w * td1).mean()
+            loss2 = (w * td2).mean()
+            critic_loss = loss1 + loss2
+        
+        else:
+            critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
